@@ -28,7 +28,7 @@ INTERNAL_LLM_MODEL="gpt-4.1-mini"
 
 ```bash
 uv sync
-uvicorn app:app --host 0.0.0.0 --port 8000
+uv run uvicorn app:app --host 0.0.0.0 --port 8000
 ```
 
 ## API

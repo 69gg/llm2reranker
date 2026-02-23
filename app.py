@@ -14,16 +14,12 @@ from dotenv import load_dotenv
 # -----------------------------
 # 配置
 # -----------------------------
-load_dotenv()  # 从 .env 文件加载环境变量
-
+load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 INTERNAL_LLM_MODEL = os.getenv("INTERNAL_LLM_MODEL", "gpt-4.1-mini")
 
-client = AsyncOpenAI(
-    api_key=OPENAI_API_KEY,
-    base_url=OPENAI_BASE_URL,
-)
+client = AsyncOpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
 
 
 # -----------------------------
@@ -32,7 +28,7 @@ client = AsyncOpenAI(
 class RerankRequest(BaseModel):
     model_config = ConfigDict(extra="allow")  # 允许透传额外字段（兼容性更强）
 
-    model: str = Field(..., description="外部请求的reranker模型名（仅记录/兼容字段）")
+    model: str = Field(..., description="外部请求的reranker模型名（仅兼容字段，不参与内部选择）")
     query: str
     documents: List[Union[str, Dict[str, Any]]]  # 兼容: ["text", ...] 或 [{"text": "..."}]
     top_n: int = 10
@@ -52,7 +48,7 @@ class RerankResult(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
         ser_json_exclude_none=True,  # ✅ None 字段不序列化 => document 字段彻底消失
-    ) # type: ignore
+    )
 
 
 class RerankMetaBilledUnits(BaseModel):
@@ -76,34 +72,6 @@ class RerankResponse(BaseModel):
     id: str
     results: List[RerankResult]
     meta: RerankMeta
-
-
-# -----------------------------
-# LLM 输出 JSON Schema（只允许 index + relevance_score）
-# -----------------------------
-RERANK_JSON_SCHEMA: Dict[str, Any] = {
-    "name": "rerank_output",
-    "schema": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "results": {
-                "type": "array",
-                "minItems": 1,
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "index": {"type": "integer", "minimum": 0},
-                        "relevance_score": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-                    },
-                    "required": ["index", "relevance_score"],
-                },
-            }
-        },
-        "required": ["results"],
-    },
-}
 
 
 # -----------------------------
@@ -151,40 +119,61 @@ def enforce_unique_and_bounds(
         cleaned.append({"index": idx, "relevance_score": clamp01(score)})
 
     cleaned.sort(key=lambda x: x["relevance_score"], reverse=True)
-
-    # 不足 top_n 自动补齐（防止上游依赖 top_n 个结果）
-    if len(cleaned) < min(top_n, doc_count):
-        missing = [i for i in range(doc_count) if i not in seen]
-        base = 0.05
-        step = 0.01
-        for j, idx in enumerate(missing):
-            cleaned.append({"index": idx, "relevance_score": clamp01(base - j * step)})
-            if len(cleaned) >= min(top_n, doc_count):
-                break
-
-    cleaned.sort(key=lambda x: x["relevance_score"], reverse=True)
     return cleaned[: min(top_n, doc_count)]
 
 
 # -----------------------------
-# 核心：调用 LLM 做 rerank（全异步）
+# Tool / Function schema：模型只能通过 tool_call 返回 index+score
+# -----------------------------
+RERANK_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "rerank",
+        "description": "Return reranking results as indices and relevance scores (0~1). Do NOT return document text.",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "results": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "index": {"type": "integer", "minimum": 0},
+                            "relevance_score": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                        },
+                        "required": ["index", "relevance_score"],
+                    },
+                }
+            },
+            "required": ["results"],
+        },
+    },
+}
+
+
+# -----------------------------
+# 核心：调用 LLM 做 rerank（全异步，强制走 tool call）
 # -----------------------------
 async def llm_rerank(query: str, docs: List[str], top_n: int) -> Dict[str, Any]:
     numbered_docs = "\n".join([f"[{i}] {t}" for i, t in enumerate(docs)])
 
     system = (
         "你是一个高精度的检索重排序器（reranker）。"
-        "你必须只输出符合给定 JSON Schema 的JSON，不要输出多余文字。"
-        "只返回每个结果的 index 和 relevance_score（0~1），不要返回文档文本。"
+        "你必须通过工具调用 rerank() 返回结果。"
+        "不要输出任何普通文本内容。"
+        "rerank(results=...) 里只包含 index 和 relevance_score（0~1）。"
         "relevance_score 越大越相关。index 不要重复。"
-        "results 的数量尽量等于 top_n。"
+        "results 数量应当等于 top_n（如果文档不足就返回全部）。"
     )
 
     user = (
         f"Query:\n{query}\n\n"
         f"Documents:\n{numbered_docs}\n\n"
-        f"Task:\n从 Documents 中选出最相关的 top_n={top_n} 个，"
-        f"给出它们的 index 和 relevance_score（0~1）。"
+        f"Task:\n从 Documents 中选出最相关的 top_n={top_n} 个。"
+        f"只通过 rerank() 工具返回它们的 index 和 relevance_score。"
     )
 
     resp = await client.chat.completions.create(
@@ -194,22 +183,39 @@ async def llm_rerank(query: str, docs: List[str], top_n: int) -> Dict[str, Any]:
             {"role": "user", "content": user},
         ],
         temperature=0,
-        response_format={
-            "type": "json_schema",
-            "json_schema": RERANK_JSON_SCHEMA,
-        }, # type: ignore
+        tools=[RERANK_TOOL],
+        # ✅ 强制模型必须调用这个函数（避免它在 message.content 里胡写）
+        tool_choice={"type": "function", "function": {"name": "rerank"}},
     )
-
-    content = resp.choices[0].message.content or "{}"
-    data = json.loads(content)
 
     usage = getattr(resp, "usage", None)
     prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
     completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
 
-    ranked_raw = data.get("results", [])
+    msg = resp.choices[0].message
+    tool_calls = getattr(msg, "tool_calls", None)
+    if not tool_calls:
+        # 让它 crash：把关键返回信息带上，方便你抓兼容层问题
+        raise RuntimeError(
+            f"No tool_calls returned. message.content={getattr(msg, 'content', None)!r}"
+        )
+
+    # 取第一个 rerank 工具调用
+    tc0 = tool_calls[0]
+    fn = getattr(tc0, "function", None)
+    if not fn or getattr(fn, "name", "") != "rerank":
+        raise RuntimeError(f"Unexpected tool call: {tc0}")
+
+    args_str = getattr(fn, "arguments", None)
+    if not args_str:
+        raise RuntimeError("Tool call arguments is empty.")
+
+    args = json.loads(args_str)  # 如果它不是JSON，那就 crash（你说 let it crash）
+    ranked_raw = args["results"]
+
     ranked = enforce_unique_and_bounds(ranked_raw, doc_count=len(docs), top_n=top_n)
 
+    # 如果你非常严格要 top_n 个：这里可补齐；你说剩下不考虑，我就不补了
     return {
         "ranked": ranked,
         "usage": {
@@ -222,13 +228,13 @@ async def llm_rerank(query: str, docs: List[str], top_n: int) -> Dict[str, Any]:
 # -----------------------------
 # FastAPI：对外 rerank endpoint
 # -----------------------------
-app = FastAPI(title="llm2reranker", version="0.2.0")
+app = FastAPI(title="llm2reranker", version="0.3.0")
 
 
 @app.post(
     "/v1/rerank",
     response_model=RerankResponse,
-    response_model_exclude_none=True,  # ✅ 确保 document=None 时字段不出现（完全兼容 return_documents=false 格式）
+    response_model_exclude_none=True,  # ✅ return_documents=false 时 document 字段完全不出现
 )
 async def rerank(req: RerankRequest):
     if not OPENAI_API_KEY:
@@ -242,7 +248,7 @@ async def rerank(req: RerankRequest):
 
     _t0 = time.time()
     rr = await llm_rerank(req.query, docs_text, top_n=top_n)
-    _elapsed = time.time() - _t0  # 不用就留着，方便你以后打日志
+    _elapsed = time.time() - _t0  # 留着以后你自己打日志
 
     ranked: List[Dict[str, Any]] = rr["ranked"]
     prompt_tokens = int(rr["usage"].get("prompt_tokens", 0))
@@ -262,7 +268,6 @@ async def rerank(req: RerankRequest):
                 )
             )
         else:
-            # ✅ document 字段完全不出现（靠 response_model_exclude_none + ser_json_exclude_none）
             results.append(
                 RerankResult(
                     document=None,

@@ -1,0 +1,16 @@
+[project]
+name = "llm2reranker"
+version = "0.1.0"
+description = "一个简单LLM转重排库，基于OpenAI SDK。"
+readme = "README.md"
+authors = [
+    { name = "Null", email = "1708213363@qq.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.131.0",
+    "openai>=2.21.0",
+    "pydantic>=2.12.5",
+    "python-dotenv>=1.2.1",
+    "uvicorn>=0.41.0",
+]

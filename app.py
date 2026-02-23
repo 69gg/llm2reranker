@@ -2,6 +2,7 @@ import os
 import json
 import time
 import uuid
+import re
 from typing import Any, Dict, List, Optional, Union
 
 from fastapi import FastAPI, HTTPException
@@ -14,6 +15,7 @@ from dotenv import load_dotenv
 # -----------------------------
 # 配置
 # -----------------------------
+
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
@@ -23,14 +25,13 @@ client = AsyncOpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
 
 
 # -----------------------------
-# 入参/出参（兼容 rerank 常见格式）
+# 入参/出参
 # -----------------------------
 class RerankRequest(BaseModel):
-    model_config = ConfigDict(extra="allow")  # 允许透传额外字段（兼容性更强）
-
-    model: str = Field(..., description="外部请求的reranker模型名（仅兼容字段，不参与内部选择）")
+    model_config = ConfigDict(extra="allow")
+    model: str
     query: str
-    documents: List[Union[str, Dict[str, Any]]]  # 兼容: ["text", ...] 或 [{"text": "..."}]
+    documents: List[Union[str, Dict[str, Any]]]
     top_n: int = 10
     return_documents: bool = True
 
@@ -40,14 +41,13 @@ class RerankResultDocument(BaseModel):
 
 
 class RerankResult(BaseModel):
-    # 关键：return_documents=false 时必须完全不出现 document 字段
     document: Optional[RerankResultDocument] = None
     index: int
     relevance_score: float
 
     model_config = ConfigDict(
         extra="forbid",
-        ser_json_exclude_none=True,  # ✅ None 字段不序列化 => document 字段彻底消失
+        ser_json_exclude_none=True,  # ✅ None 不序列化 => return_documents=false 时不出现 document
     )
 
 
@@ -75,7 +75,7 @@ class RerankResponse(BaseModel):
 
 
 # -----------------------------
-# 工具函数：抽取 documents 文本
+# utils
 # -----------------------------
 def normalize_documents(docs: List[Union[str, Dict[str, Any]]]) -> List[str]:
     out: List[str] = []
@@ -103,10 +103,8 @@ def enforce_unique_and_bounds(
     doc_count: int,
     top_n: int,
 ) -> List[Dict[str, Any]]:
-    """确保 index 合法、去重、并截断到 top_n。"""
     seen = set()
     cleaned: List[Dict[str, Any]] = []
-
     for r in results:
         idx = int(r["index"])
         if idx < 0 or idx >= doc_count:
@@ -114,7 +112,6 @@ def enforce_unique_and_bounds(
         if idx in seen:
             continue
         seen.add(idx)
-
         score = float(r.get("relevance_score", 0.0))
         cleaned.append({"index": idx, "relevance_score": clamp01(score)})
 
@@ -122,8 +119,38 @@ def enforce_unique_and_bounds(
     return cleaned[: min(top_n, doc_count)]
 
 
+_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)\s*```", re.IGNORECASE)
+
+
+def parse_results_from_message_content(content: str) -> List[Dict[str, Any]]:
+    """
+    适配这种：
+      ```json
+      {"results":[...]}
+      ```
+    或者直接就是 {"results":[...]}。
+    """
+    if content is None:
+        raise RuntimeError("message.content is None")
+
+    s = content.strip()
+    m = _JSON_FENCE_RE.search(s)
+    if m:
+        s = m.group(1).strip()
+
+    data = json.loads(s)
+    if not isinstance(data, dict) or "results" not in data:
+        raise RuntimeError(f"content JSON missing 'results': {data!r}")
+
+    results = data["results"]
+    if not isinstance(results, list):
+        raise RuntimeError("content JSON 'results' is not a list")
+
+    return results
+
+
 # -----------------------------
-# Tool / Function schema：模型只能通过 tool_call 返回 index+score
+# Tool schema（模型支持就走 tool_calls；不支持也没关系）
 # -----------------------------
 RERANK_TOOL = {
     "type": "function",
@@ -155,25 +182,26 @@ RERANK_TOOL = {
 
 
 # -----------------------------
-# 核心：调用 LLM 做 rerank（全异步，强制走 tool call）
+# LLM rerank
 # -----------------------------
 async def llm_rerank(query: str, docs: List[str], top_n: int) -> Dict[str, Any]:
     numbered_docs = "\n".join([f"[{i}] {t}" for i, t in enumerate(docs)])
 
     system = (
         "你是一个高精度的检索重排序器（reranker）。"
-        "你必须通过工具调用 rerank() 返回结果。"
-        "不要输出任何普通文本内容。"
-        "rerank(results=...) 里只包含 index 和 relevance_score（0~1）。"
-        "relevance_score 越大越相关。index 不要重复。"
-        "results 数量应当等于 top_n（如果文档不足就返回全部）。"
+        "优先通过工具调用 rerank() 返回结果。"
+        "如果无法进行工具调用，则直接输出一个 JSON（不要输出多余文字），格式必须是："
+        '{"results":[{"index":0,"relevance_score":0.9}, ...]}。'
+        "不要返回文档文本。"
+        "relevance_score 取值 0~1，越大越相关。index 不要重复。"
+        "results 数量尽量等于 top_n（不足则全部）。"
     )
 
     user = (
         f"Query:\n{query}\n\n"
         f"Documents:\n{numbered_docs}\n\n"
         f"Task:\n从 Documents 中选出最相关的 top_n={top_n} 个。"
-        f"只通过 rerank() 工具返回它们的 index 和 relevance_score。"
+        f"只返回它们的 index 和 relevance_score。"
     )
 
     resp = await client.chat.completions.create(
@@ -184,7 +212,7 @@ async def llm_rerank(query: str, docs: List[str], top_n: int) -> Dict[str, Any]:
         ],
         temperature=0,
         tools=[RERANK_TOOL],
-        # ✅ 强制模型必须调用这个函数（避免它在 message.content 里胡写）
+        # 尽量强制，但很多兼容层会忽略；忽略也没事，我们做 content 解析兜底
         tool_choice={"type": "function", "function": {"name": "rerank"}},
     )
 
@@ -193,49 +221,38 @@ async def llm_rerank(query: str, docs: List[str], top_n: int) -> Dict[str, Any]:
     completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
 
     msg = resp.choices[0].message
+
+    # 1) 优先走 tool_calls
     tool_calls = getattr(msg, "tool_calls", None)
-    if not tool_calls:
-        # 让它 crash：把关键返回信息带上，方便你抓兼容层问题
-        raise RuntimeError(
-            f"No tool_calls returned. message.content={getattr(msg, 'content', None)!r}"
-        )
-
-    # 取第一个 rerank 工具调用
-    tc0 = tool_calls[0]
-    fn = getattr(tc0, "function", None)
-    if not fn or getattr(fn, "name", "") != "rerank":
-        raise RuntimeError(f"Unexpected tool call: {tc0}")
-
-    args_str = getattr(fn, "arguments", None)
-    if not args_str:
-        raise RuntimeError("Tool call arguments is empty.")
-
-    args = json.loads(args_str)  # 如果它不是JSON，那就 crash（你说 let it crash）
-    ranked_raw = args["results"]
+    if tool_calls:
+        tc0 = tool_calls[0]
+        fn = getattr(tc0, "function", None)
+        if not fn or getattr(fn, "name", "") != "rerank":
+            raise RuntimeError(f"Unexpected tool call: {tc0}")
+        args_str = getattr(fn, "arguments", None)
+        if not args_str:
+            raise RuntimeError("Tool call arguments is empty.")
+        args = json.loads(args_str)
+        ranked_raw = args["results"]
+    else:
+        # 2) 适配：模型把 JSON 放进 message.content（甚至包在 ```json``` 里）
+        ranked_raw = parse_results_from_message_content(getattr(msg, "content", "") or "")
 
     ranked = enforce_unique_and_bounds(ranked_raw, doc_count=len(docs), top_n=top_n)
 
-    # 如果你非常严格要 top_n 个：这里可补齐；你说剩下不考虑，我就不补了
     return {
         "ranked": ranked,
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-        },
+        "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens},
     }
 
 
 # -----------------------------
-# FastAPI：对外 rerank endpoint
+# FastAPI
 # -----------------------------
-app = FastAPI(title="llm2reranker", version="0.3.0")
+app = FastAPI(title="llm2reranker", version="0.4.0")
 
 
-@app.post(
-    "/v1/rerank",
-    response_model=RerankResponse,
-    response_model_exclude_none=True,  # ✅ return_documents=false 时 document 字段完全不出现
-)
+@app.post("/v1/rerank", response_model=RerankResponse, response_model_exclude_none=True)
 async def rerank(req: RerankRequest):
     if not OPENAI_API_KEY:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set")
@@ -248,7 +265,7 @@ async def rerank(req: RerankRequest):
 
     _t0 = time.time()
     rr = await llm_rerank(req.query, docs_text, top_n=top_n)
-    _elapsed = time.time() - _t0  # 留着以后你自己打日志
+    _elapsed = time.time() - _t0  # 留着以后你打日志
 
     ranked: List[Dict[str, Any]] = rr["ranked"]
     prompt_tokens = int(rr["usage"].get("prompt_tokens", 0))
@@ -258,7 +275,6 @@ async def rerank(req: RerankRequest):
     for item in ranked:
         idx = int(item["index"])
         score = float(item["relevance_score"])
-
         if req.return_documents:
             results.append(
                 RerankResult(
@@ -268,13 +284,7 @@ async def rerank(req: RerankRequest):
                 )
             )
         else:
-            results.append(
-                RerankResult(
-                    document=None,
-                    index=idx,
-                    relevance_score=score,
-                )
-            )
+            results.append(RerankResult(document=None, index=idx, relevance_score=score))
 
     meta = RerankMeta(
         billed_units=RerankMetaBilledUnits(
@@ -283,17 +293,10 @@ async def rerank(req: RerankRequest):
             search_units=0,
             classifications=0,
         ),
-        tokens=RerankMetaTokens(
-            input_tokens=prompt_tokens,
-            output_tokens=completion_tokens,
-        ),
+        tokens=RerankMetaTokens(input_tokens=prompt_tokens, output_tokens=completion_tokens),
     )
 
-    return RerankResponse(
-        id=uuid.uuid4().hex,
-        results=results,
-        meta=meta,
-    )
+    return RerankResponse(id=uuid.uuid4().hex, results=results, meta=meta)
 
 
 @app.get("/healthz")

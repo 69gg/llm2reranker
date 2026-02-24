@@ -3,6 +3,7 @@ import json
 import time
 import uuid
 import re
+import logging
 from typing import Any, Dict, List, Optional, Union
 
 from fastapi import FastAPI, HTTPException
@@ -15,6 +16,9 @@ from dotenv import load_dotenv
 # -----------------------------
 # 配置
 # -----------------------------
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -263,13 +267,15 @@ async def rerank(req: RerankRequest):
 
     top_n = req.top_n if req.top_n and req.top_n > 0 else 10
 
+    logger.info("rerank query=%r docs=%d top_n=%d model=%s", req.query[:80], len(docs_text), top_n, req.model)
     _t0 = time.time()
     rr = await llm_rerank(req.query, docs_text, top_n=top_n)
-    _elapsed = time.time() - _t0  # 留着以后你打日志
+    _elapsed = time.time() - _t0
 
     ranked: List[Dict[str, Any]] = rr["ranked"]
     prompt_tokens = int(rr["usage"].get("prompt_tokens", 0))
     completion_tokens = int(rr["usage"].get("completion_tokens", 0))
+    logger.info("rerank done elapsed=%.2fs prompt=%d completion=%d results=%d", _elapsed, prompt_tokens, completion_tokens, len(ranked))
 
     results: List[RerankResult] = []
     for item in ranked:

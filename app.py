@@ -17,13 +17,14 @@ from dotenv import load_dotenv
 # 配置
 # -----------------------------
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 INTERNAL_LLM_MODEL = os.getenv("INTERNAL_LLM_MODEL", "gpt-4.1-mini")
+THINKING = os.getenv("THINKING", "false").lower() == "true"
 
 client = AsyncOpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
 
@@ -216,8 +217,8 @@ async def llm_rerank(query: str, docs: List[str], top_n: int) -> Dict[str, Any]:
         ],
         temperature=0,
         tools=[RERANK_TOOL],
-        # 尽量强制，但很多兼容层会忽略；忽略也没事，我们做 content 解析兜底
         tool_choice={"type": "function", "function": {"name": "rerank"}},
+        extra_body={"thinking": THINKING},
     )
 
     usage = getattr(resp, "usage", None)
@@ -236,11 +237,14 @@ async def llm_rerank(query: str, docs: List[str], top_n: int) -> Dict[str, Any]:
         args_str = getattr(fn, "arguments", None)
         if not args_str:
             raise RuntimeError("Tool call arguments is empty.")
+        logger.debug("tool_call args len=%d preview=%.200s", len(args_str), args_str)
         args = json.loads(args_str)
         ranked_raw = args["results"]
     else:
         # 2) 适配：模型把 JSON 放进 message.content（甚至包在 ```json``` 里）
-        ranked_raw = parse_results_from_message_content(getattr(msg, "content", "") or "")
+        content_raw = getattr(msg, "content", "") or ""
+        logger.debug("content fallback len=%d preview=%.200s", len(content_raw), content_raw)
+        ranked_raw = parse_results_from_message_content(content_raw)
 
     ranked = enforce_unique_and_bounds(ranked_raw, doc_count=len(docs), top_n=top_n)
 
